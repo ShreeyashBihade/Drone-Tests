@@ -11,18 +11,18 @@ Hover-only build:
 Pitch / Roll / Yaw setpoints are fixed at 0 — no movement control.
 Motor mixing is retained so the frame stays level via attitude error.
 
-Pin / Motor layout:
-    ESC1  TR  GPIO12  CW
-    ESC2  BR  GPIO13  CCW
-    ESC3  BL  GPIO18  CW
-    ESC4  TL  GPIO19  CCW
-
-Motor mixing (X-frame):
-         Throttle  Pitch  Roll
-    TR      +1      -1    -1
-    BR      +1      +1    -1
-    BL      +1      +1    +1
-    TL      +1      -1    +1
+# Pin / Motor layout:
+#     ESC1  FR  GPIO12  CW
+#     ESC2  RR  GPIO13  CCW
+#     ESC3  RL  GPIO18  CW
+#     ESC4  FL  GPIO19  CCW
+#
+# Motor mixing (X-frame):
+#              Throttle  Pitch  Roll  Yaw
+#     FR CW      +1       -1    -1    +1
+#     RR CCW     +1       +1    -1    -1
+#     RL CW      +1       +1    +1    +1
+#     FL CCW     +1       -1    +1    -1
 
 Usage:
     sudo pigpiod
@@ -44,10 +44,10 @@ from time import perf_counter, sleep
 MPU_ADDRESS = 0x68
 
 MOTOR_PINS = {
-    "TR": 12,
-    "BR": 13,
-    "BL": 18,
-    "TL": 19,
+    "FR": 12,
+    "RR": 13,
+    "RL": 18,
+    "FL": 19,
 }
 
 PWM_MIN = 1000   # µs
@@ -159,20 +159,25 @@ class PID:
 #  MOTOR HELPERS
 # ══════════════════════════════════════════════════════════════════
 
-def mix_motors(throttle_us: float, pitch_out: float, roll_out: float) -> dict:
+def mix_motors(throttle_us: float, pitch_out: float,
+               roll_out: float, yaw_out: float) -> dict:
     """
-    X-frame mixing — throttle only build, yaw locked at 0.
-         Throttle  Pitch  Roll
-    TR      +1      -1    -1
-    BR      +1      +1    -1
-    BL      +1      +1    +1
-    TL      +1      -1    +1
+    X-frame mixing.
+              Throttle  Pitch  Roll  Yaw
+    FR CW        +1      -1    -1    +1
+    RR CCW       +1      +1    -1    -1
+    RL CW        +1      +1    +1    +1
+    FL CCW       +1      -1    +1    -1
+
+    Yaw sign rule:
+      CW  motors (FR, RL) → +yaw_out
+      CCW motors (RR, FL) → -yaw_out
     """
     raw = {
-        "TR": throttle_us - pitch_out - roll_out,
-        "BR": throttle_us + pitch_out - roll_out,
-        "BL": throttle_us + pitch_out + roll_out,
-        "TL": throttle_us - pitch_out + roll_out,
+        "FR": throttle_us - pitch_out - roll_out + yaw_out,
+        "RR": throttle_us + pitch_out - roll_out - yaw_out,
+        "RL": throttle_us + pitch_out + roll_out + yaw_out,
+        "FL": throttle_us - pitch_out + roll_out - yaw_out,
     }
     return {k: max(PWM_MIN, min(PWM_MAX, int(v))) for k, v in raw.items()}
 
@@ -269,7 +274,8 @@ def main():
     kf_pitch = Kalman2D()
     kf_roll  = Kalman2D()
 
-    pid = PID(**PID_CFG)
+    pid_pitch_roll = PID(**PID_CFG)
+    pid_yaw = PID(Kp=2.0, Ki=0.01, Kd=0.1, integral_limit=30.0)
 
     # ── Sockets ────────────────────────────────────────────────────
     # settimeout(0.001) = 1 ms timeout per recv call.
@@ -300,7 +306,7 @@ def main():
     print(f"  Flight UDP  : port {FLIGHT_PORT}")
     print(f"  Tuning UDP  : port {TUNING_PORT}")
     print(f"  Tilt cutoff : ±{TILT_CUTOFF_DEG}°")
-    print(f"  PID start   : Kp={pid.Kp} Ki={pid.Ki} Kd={pid.Kd}")
+    print(f"  PID start   : Kp={pid_pitch_roll.Kp} Ki={pid_pitch_roll.Ki} Kd={pid_pitch_roll.Kd}")
     print("  Ctrl+C to stop")
     print("=" * 50 + "\n")
 
@@ -336,12 +342,12 @@ def main():
             try:
                 tdata, _ = tuning_sock.recvfrom(1024)
                 tpkt = json.loads(tdata.decode())
-                pid.update_gains(
+                pid_pitch_roll.update_gains(
                     Kp=tpkt.get("kp"),
                     Ki=tpkt.get("ki"),
                     Kd=tpkt.get("kd"),
                 )
-                print(f"\n  [TUNE] Kp={pid.Kp:.4f}  Ki={pid.Ki:.4f}  Kd={pid.Kd:.4f}  "
+                print(f"\n  [TUNE] Kp={pid_pitch_roll.Kp:.4f}  Ki={pid_pitch_roll.Ki:.4f}  Kd={pid_pitch_roll.Kd:.4f}  "
                       f"(integral reset)")
             except (socket.timeout, json.JSONDecodeError):
                 pass
@@ -354,7 +360,8 @@ def main():
                     controller_connected = False
                     print(f"\n  Controller disconnected!")
                 print(f"  NO SIGNAL {elapsed:.1f}s — motors MIN  ", end="\r")
-                pid.reset()
+                pid_pitch_roll.reset()
+                pid_yaw.reset()
                 tilt_killed = False
                 continue
 
@@ -364,6 +371,7 @@ def main():
             ax, ay, az = accel['x'], accel['y'], accel['z']
             gx = gyro['x'] - offsets['gx']
             gy = gyro['y'] - offsets['gy']
+            gz = gyro['z'] - offsets['gz']
 
             accel_pitch = math.atan2(-ax, az)                       * (180/math.pi) - offsets['pitch']
             accel_roll  = -math.atan2(ay, math.sqrt(ax**2 + az**2)) * (180/math.pi) - offsets['roll']
@@ -377,7 +385,8 @@ def main():
                     print(f"\n  ⚠ TILT CUTOFF! pitch={pitch:.1f}° roll={roll:.1f}° — MOTORS KILLED")
                     tilt_killed = True
                 all_motors_min(pi)
-                pid.reset()
+                pid_pitch_roll.reset()
+                pid_yaw.reset()
                 continue
             else:
                 tilt_killed = False
@@ -385,7 +394,8 @@ def main():
             # ── PID & mixing ───────────────────────────────────────
             if throttle_pct < 5.0:
                 all_motors_min(pi)
-                pid.reset()
+                pid_pitch_roll.reset()
+                pid_yaw.reset()
                 print(f"  IDLE  P:{pitch:+5.1f}°  R:{roll:+5.1f}°  Thr:  0%  "
                       f"[all motors MIN]        ", end="\r")
                 continue
@@ -393,17 +403,18 @@ def main():
             throttle_us = throttle_pct_to_us(throttle_pct)
 
             # PID corrects tilt — setpoint is 0° for both axes (hover flat)
-            pitch_corr = pid.compute(0.0, pitch, dt)
-            roll_corr  = pid.compute(0.0, roll,  dt)
+            pitch_corr = pid_pitch_roll.compute(0.0, pitch, dt)
+            roll_corr  = pid_pitch_roll.compute(0.0, roll,  dt)
+            yaw_corr   = pid_yaw.compute(0.0, gz, dt)  # setpoint = 0 °/s yaw rate
 
-            pwm = mix_motors(throttle_us, pitch_corr, roll_corr)
+            pwm = mix_motors(throttle_us, pitch_corr, roll_corr, yaw_corr)
             set_motors(pi, pwm)
 
             print(
                 f"  Thr:{throttle_pct:3.0f}%  "
                 f"P:{pitch:+5.1f}°  R:{roll:+5.1f}°  "
-                f"Pcorr:{pitch_corr:+5.0f}  Rcorr:{roll_corr:+5.0f}  "
-                f"TR:{pwm['TR']} BR:{pwm['BR']} BL:{pwm['BL']} TL:{pwm['TL']}µs  ",
+                f"Pcorr:{pitch_corr:+5.0f}  Rcorr:{roll_corr:+5.0f}  Ycorr:{yaw_corr:+5.0f}  "
+                f"FR:{pwm['FR']} RR:{pwm['RR']} RL:{pwm['RL']} FL:{pwm['FL']}µs  ",
                 end="\r"
             )
 
